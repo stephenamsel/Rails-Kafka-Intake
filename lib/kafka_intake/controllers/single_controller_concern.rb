@@ -1,4 +1,4 @@
-module  SingleControllerConcern
+module  KafkaIntake::SingleControllerConcern
     extend ActiveSupport::Concern
     
     included do

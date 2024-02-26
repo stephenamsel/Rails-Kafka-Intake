@@ -4,7 +4,7 @@ module KafkaIntake
         # reference: https://stackoverflow.com/questions/3457067/ruby-on-rails-get-the-controller-and-action-name-based-on-a-path
         # reference: https://stackoverflow.com/questions/5767222/rails-call-another-controller-action-from-a-controller#comment74479993_30143216
 
-        def NoIdentifierError < 
+        def NoIdentifierError < StandardError
         def perform(key, messages)
 
             topic = key[0]
@@ -13,75 +13,89 @@ module KafkaIntake
             action = action_hash[:action].to_sym
             controller_class = action_hash[:controller].constantize
 
-            batch_info = []
-            messages.each do |message|
-                payload = JSON.parse(message.payload)
-                id = payload['Id']
-                body = payload['Body']
-                headers = payload['Headers']
+            if is_bulk_controller?(controller_class)
+                # This gives the option towrite a Controller action that would handle all messages in bulk
+                # This may allow more efficient contact with the database
 
-                query_params = Rack::Utils.parse_query URI(message.topic).query
-                path_params = Rails.application.routes.recognize_path(message.topic)
-                body_params = params.merge(body) if body.present?
-
-                params = query_params.merge(body_params).merge(path_params) # path parameters take precedence
-                batch_info.push(params.merge(kafka_intake_identifier: id))
-            end
-
-            if defined?(controller_class::KAFKA_INTAKE_BULK_CONTROLLER) && controller_class::KAFKA_INTAKE_BULK_CONTROLLER
-                # this is a Bulk action designed to handle an array of parameters
-                # The action must manage its own parallelization and atomicity as it is assumed this will use bulk DB queries
+                # The action must manage its own parallelization and atomicity
+                # as it is assumed this will use bulk DB queries
                 # Its response should be an array of responses to the original requests
                 # with each response tagged with a "kafka_identifier" parameter to be used for publishing
-                # It must also manage status-codes for each
+                # It must also manage status-codes for each as required for the Kafka responses
+                controller = controller_class.new
+                controller.params = JSON.parse(messages)
+                controller.process(topic.to_sym)
 
-                responses = JSON.parse(run_action(controller_class, action, { parameters: batch_info }).body)
+                responses = JSON.parse(controller.response.body)
                 responses.each do |response|
                     Ractor.new(response) do |response|
                         produce(response[:kafka_intake_identifier], response.except(:kafka_intake_identifier).to_json)
                     end
                 end
+                responses.each(&:take) # ensure that the Ractors are completed before the Job is ended
             else
-                # this is a normal action
+                # This is for processing Kafka messages as though they were each separate HTTP requests
                 # reference: https://docs.ruby-lang.org/en/3.2/Ractor.html
-
                 outputs = []
-                
-                batch_info.each do |message|
-                    ractor_data = [controller_class, action, message] # collecting data for Ractor
-
-                    outputs.push Ractor.new(ractor_data) do |ractor_data| # manage parallelization here
-                        klass = ractor_data[0]
-                        ractor_action = ractor_data[1]
-                        input = ractor_data[2].except(:kafka_intake_identifier)
+                messages.each_with_index do |message, index|
+                    outputs[index] = Ractor.new(controller_class, message) do
                         ActiveRecord::Base.transaction(requires_new: true) do
-                            # creates savepoint to retain fine-grained atomic transactions
-                            response = run_action(klass, ractor_action, input)
-                            produce(
-                                message[:kafka_intake_identifier], 
-                                {status: response.status, body: response.body}.to_json
-                            )
+                            begin
+                            controller = build_controller(message, controller_class) # may raise NoIdentifierError
+                                controller.process_action
+
+                                response = controller.response
+                                produce(
+                                    controller.params[:kafka_intake_identifier],
+                                    { status: response.status, body: response.body }.to_json
+                                )
+
+                            rescue NoIdentifierError => e
+                                Rails.logger.log.error({ e.class => e.message }.to_json)
+                            end
                         end
-                        response
                     end
                 end
-                outputs.each(&:take) # ensure that the data is published before ending the Job
+                messages.length.times do |i|
+                    outputs[i].take # ensure the Ractors are competed before the Job ends
+                end
             end
         end
-
-        def run_action(controller, path, dataset)
-            controller = controller_class.new
-            controller.params = ActionController::Parameters.new(dataset)
-            controller.process(path.to_sym)
-            controller.response
-        end
-
 
         def produce(id, payload)
             KafkaIntake::PRODUCER.produce(
                 topic: id,
                 payload: payload
             )
+        end
+
+        def is_bulk_controller?(controller_class)
+            is_defined?(controller_class::KAFKA_INTAKE_BULK_CONTROLLER) && 
+            controller_class::KAFKA_INTAKE_BULK_CONTROLLER
+        end
+
+        def build_controller(message, controller_class)
+            payload = JSON.parse(message.payload)
+            id = payload['Id']
+            raise NoIdentifierError("ID missing: #{message.payload}") if id.nil?
+            
+            body = payload['Body']
+            headers = payload['Headers']
+
+            query_params = Rack::Utils.parse_query URI(message.topic).query
+            path_params = Rails.application.routes.recognize_path(message.topic)
+            body_params = JSON.parse(body) if body.present?
+
+            controller = controller_class.new
+            req = ActionDispatch::Request.new(controller.middleware.middlewares.empty? ? {} : controller.middleware)
+            req.full_url = message.topic
+            req.set_header("rack.input", body)
+            headers.each { |k, v| req.headers.merge(k => v) }
+            req.request_method = verb
+            controller.request = req
+            controller.params = params.merge(kafka_intake_identifier: id)
+
+            controller
         end
     end
 end
