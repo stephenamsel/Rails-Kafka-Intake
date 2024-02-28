@@ -39,21 +39,19 @@ module KafkaIntake
                 outputs = []
                 messages.each_with_index do |message, index|
                     outputs[index] = Ractor.new(controller_class, message) do
-                        ActiveRecord::Base.transaction(requires_new: true) do
-                            begin
-                            controller = build_controller(message, controller_class) # may raise NoIdentifierError
+                        begin
+                            ActiveRecord::Base.transaction(requires_new: true) do
+                                controller = build_controller(message, controller_class) # may raise NoIdentifierError
                                 controller.process_action
-
                                 response = controller.response
-                                produce(
+                            end
+                        rescue NoIdentifierError => e
+                                Rails.logger.log.error({ e.class => e.message }.to_json)
+                        end
+                        produce(
                                     controller.params[:kafka_intake_identifier],
                                     { status: response.status, body: response.body }.to_json
                                 )
-
-                            rescue NoIdentifierError => e
-                                Rails.logger.log.error({ e.class => e.message }.to_json)
-                            end
-                        end
                     end
                 end
                 messages.length.times do |i|
