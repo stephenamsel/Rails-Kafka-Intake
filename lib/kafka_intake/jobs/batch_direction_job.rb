@@ -1,10 +1,11 @@
 module KafkaIntake
+    class NoIdentifierError < StandardError; end
     class BatchDirectionJob < ActiveJob
 
         # reference: https://stackoverflow.com/questions/3457067/ruby-on-rails-get-the-controller-and-action-name-based-on-a-path
         # reference: https://stackoverflow.com/questions/5767222/rails-call-another-controller-action-from-a-controller#comment74479993_30143216
 
-        class NoIdentifierError < StandardError; end
+        
         def perform(key, messages)
 
             topic = key[0]
