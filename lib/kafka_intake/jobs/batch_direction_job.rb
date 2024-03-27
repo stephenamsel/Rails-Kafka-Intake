@@ -1,10 +1,10 @@
 module KafkaIntake
+    class NoIdentifierError < StandardError; end
     class BatchDirectionJob < ActiveJob
 
         # reference: https://stackoverflow.com/questions/3457067/ruby-on-rails-get-the-controller-and-action-name-based-on-a-path
         # reference: https://stackoverflow.com/questions/5767222/rails-call-another-controller-action-from-a-controller#comment74479993_30143216
 
-        class NoIdentifierError < StandardError; end
         def perform(key, messages)
 
             topic = key[0]
@@ -39,20 +39,20 @@ module KafkaIntake
                 outputs = []
                 messages.each_with_index do |message, index|
                     outputs[index] = Ractor.new(controller_class, message) do
-                        ActiveRecord::Base.transaction(requires_new: true) do
+                        Rails.application.executor.wrap do # unsure if this is necessary
                             begin
-                            controller = build_controller(message, controller_class) # may raise NoIdentifierError
-                                controller.process_action
-
-                                response = controller.response
-                                produce(
-                                    controller.params[:kafka_intake_identifier],
-                                    { status: response.status, body: response.body }.to_json
-                                )
-
+                                ActiveRecord::Base.transaction(requires_new: true) do
+                                    controller = build_controller(message, controller_class) # may raise NoIdentifierError
+                                    controller.process_action
+                                    response = controller.response
+                                end
                             rescue NoIdentifierError => e
-                                Rails.logger.log.error({ e.class => e.message }.to_json)
+                                    Rails.logger.log.error({ e.class => e.message }.to_json)
                             end
+                            produce(
+                                        controller.params[:kafka_intake_identifier],
+                                        { status: response.status, body: response.body }.to_json
+                                    )
                         end
                     end
                 end
